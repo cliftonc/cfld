@@ -31,6 +31,15 @@
     "webhook"
   ],
   "license": "MIT",
+  "author": "Clifton Cunningham",
+  "homepage": "https://github.com/cliftonc/cfld#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cliftonc/cfld.git"
+  },
+  "bugs": {
+    "url": "https://github.com/cliftonc/cfld/issues"
+  },
   "dependencies": {
     "@clack/prompts": "^0.7.0",
     "boxen": "^7.1.1",
