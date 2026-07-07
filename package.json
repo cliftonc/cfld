@@ -1,0 +1,51 @@
+{
+  "name": "@cliftonc/cfld",
+  "version": "0.1.0",
+  "description": "Zero-token, persistent Cloudflare tunnel CLI for local dev — same public HTTPS URL every run.",
+  "type": "module",
+  "bin": {
+    "cfld": "dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "cloudflare",
+    "cloudflared",
+    "tunnel",
+    "ngrok",
+    "localtunnel",
+    "dev",
+    "https",
+    "webhook"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@clack/prompts": "^0.7.0",
+    "boxen": "^7.1.1",
+    "ink": "^5.2.1",
+    "picocolors": "^1.0.1",
+    "react": "^18.3.1"
+  },
+  "optionalDependencies": {
+    "cloudflared": "^0.7.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/react": "^18.3.31",
+    "tsup": "^8.1.0",
+    "typescript": "^5.5.0",
+    "vitest": "^2.0.0"
+  }
+}
