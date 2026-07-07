@@ -50,7 +50,22 @@ export async function initCommand(flags: CliFlags): Promise<void> {
   // 2. Ensure a cert for that zone (may open the browser login).
   const certPath = await ensureCert(zone, { interactive: true });
 
-  // 3. Name, port, hostname.
+  // 3. Name, port, hostname → create the tunnel + DNS + registry entry (no launch).
+  await configureProject(flags, { zone, certPath, cwd });
+  note("Run `cfld` to go live.");
+}
+
+/**
+ * Interactive project configuration, shared by `cfld init` and `cfld setup`:
+ * prompt for name/port, reconcile the tunnel + DNS + registry entry, and write
+ * `.cfld.json`. Does NOT run the tunnel. Returns the resolved hostname/port.
+ */
+export async function configureProject(
+  flags: CliFlags,
+  ctx: { zone: string; certPath: string; cwd?: string },
+): Promise<{ name: string; hostname: string; port: number }> {
+  const cwd = ctx.cwd ?? process.cwd();
+
   const defaultSlug = deriveSlug(cwd, flags.name);
   const name = slugify((await askText("Project name (used in the URL)", defaultSlug)) || defaultSlug);
   const detected = await detectDevPorts();
@@ -62,15 +77,14 @@ export async function initCommand(flags: CliFlags): Promise<void> {
   if (!Number.isInteger(port) || port <= 0) {
     throw new CfldError(`"${portStr}" is not a valid port.`);
   }
-  const hostname = flags.host ?? buildHostname(name, zone);
+  const hostname = flags.host ?? buildHostname(name, ctx.zone);
 
-  // 4. Create the tunnel + DNS + registry entry (no launch).
   const result = await reconcile(
     {
       slug: name,
       tunnelName: tunnelNameForSlug(name),
-      zone,
-      certPath,
+      zone: ctx.zone,
+      certPath: ctx.certPath,
       routes: [{ hostname, port }],
       projectDir: cwd,
       force: flags.force,
@@ -84,7 +98,7 @@ export async function initCommand(flags: CliFlags): Promise<void> {
 
   writeProjectConfig(cwd, {
     name,
-    zone,
+    zone: ctx.zone,
     uuid: result.uuid,
     hostname,
     port,
@@ -94,5 +108,5 @@ export async function initCommand(flags: CliFlags): Promise<void> {
   if (ensureGitignored(cwd, ".cfld.json")) info("Added .cfld.json to .gitignore.");
 
   done(`Configured https://${hostname} → localhost:${port}`);
-  note("Run `cfld` to go live.");
+  return { name, hostname, port };
 }

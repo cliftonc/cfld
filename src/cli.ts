@@ -8,6 +8,7 @@ import { runCommand } from "./commands/run.js";
 import { quickCommand } from "./commands/quick.js";
 import { loginCommand } from "./commands/login.js";
 import { initCommand } from "./commands/init.js";
+import { setupCommand, isBlankFirstRun } from "./commands/setup.js";
 import { listCommand } from "./commands/list.js";
 import { statusCommand } from "./commands/status.js";
 import { upCommand } from "./commands/up.js";
@@ -72,6 +73,7 @@ export function resolveExec(
 }
 
 const SUBCOMMANDS = new Set([
+  "setup",
   "login",
   "init",
   "list",
@@ -86,11 +88,12 @@ const SUBCOMMANDS = new Set([
 const HELP = `${pc.bold("cfld")} — persistent Cloudflare tunnels for local dev
 
 ${pc.bold("Usage")}
+  cfld --quick [port]      Instant public URL, no account needed (temporary)
+  cfld setup               Guided first-run: free instant URL, or persistent setup
   cfld [port]              Ensure + run a persistent tunnel (reuses the same URL)
   cfld [port] -- <cmd>     Run + supervise your dev server too (one lifecycle)
-  cfld --quick [port]      Ephemeral trycloudflare.com URL (no domain needed)
   cfld login [--reauth]    Authorize with Cloudflare in your browser
-  cfld init                Interactive setup wizard (configure, don't run)
+  cfld init                Configure a persistent tunnel (don't run)
   cfld list                List all tunnels across projects/domains
   cfld status [name]       Show details for a tunnel
   cfld up <name>           Run a registered tunnel by name from anywhere
@@ -173,6 +176,9 @@ async function main(rawArgv: string[]): Promise<void> {
       case "help":
         process.stdout.write(HELP);
         return;
+      case "setup":
+        await setupCommand(flags);
+        return;
       case "login":
         await loginCommand(flags);
         return;
@@ -210,6 +216,10 @@ async function main(rawArgv: string[]): Promise<void> {
 
   if (flags.quick) {
     await quickCommand(flags);
+  } else if (isBlankFirstRun(flags, process.cwd())) {
+    // Nothing configured and nothing authorized — guide the user instead of
+    // dropping them into a lazy failure chain.
+    await setupCommand(flags);
   } else {
     await runCommand(flags);
   }

@@ -4,16 +4,43 @@
 
 `cfld` wraps [`cloudflared`](https://github.com/cloudflare/cloudflared) into a frictionless dev experience: the **same** custom URL every run (not a random `trycloudflare.com` one), authorized with a **browser login** (zero API tokens), reusing the same named tunnel and DNS record across restarts instead of churning them. It runs a **live dashboard** (URL, connection count, request/latency counters, tailing logs), **auto-reconnects** on edge blips, and **guards** against stealing a DNS record that belongs to another tunnel.
 
+## Getting started
+
+**New here? Just run this — it walks you through everything, no account or config needed to start:**
+
 ```bash
-# one-off, no install
-npx @cliftonc/cfld            # detect your dev port, reuse-or-create a tunnel, go live
+npx @cliftonc/cfld setup
+```
+
+`setup` is the front door. It checks `cloudflared` for you, then lets you pick:
+
+1. **A public URL right now** — free, no account, no domain (a temporary `trycloudflare.com` URL). Great for a webhook, a demo, or just trying it.
+2. **A persistent custom URL** — opens the browser to sign in (or **sign up** — it's free), then wires up the same URL for every future run.
+
+You don't even have to remember `setup`: the **first time you run bare `cfld`** in a fresh project, it drops you into this same guided flow so you're never stuck guessing.
+
+Already know what you want? Skip straight to it:
+
+```bash
+# instant public URL in seconds — no account, no config
+npx @cliftonc/cfld --quick 3000   # temporary trycloudflare.com URL
+
+# the everyday command — reuse-or-create your persistent tunnel and go live
+npx @cliftonc/cfld            # detect your dev port, go live on the same URL
 npx @cliftonc/cfld 3000       # explicit port
-npx @cliftonc/cfld --quick    # ephemeral trycloudflare.com URL — no domain needed
 
 # or install once and use the short `cfld` command everywhere
 npm i -g @cliftonc/cfld
-cfld
+cfld setup
 ```
+
+### What it costs
+
+`cfld` is built to get you going at zero → near-zero cost, and it's honest about the one thing it can't automate:
+
+- **Instant URL** — `cfld --quick`: **free**, no account, no domain. The URL is temporary and changes each run.
+- **Cloudflare account** — **free**. `cfld` opens the browser to sign in (the same page has a **Sign up** link); there's no API token to create. Account signup itself can't be scripted — Cloudflare requires a browser, terms acceptance, and email verification.
+- **Persistent custom URL** — needs a **domain on Cloudflare**. Free if you already own one (just add the site); otherwise a domain is a few dollars/year via [Cloudflare Registrar](https://dash.cloudflare.com/?to=/:account/domains/register). No account has a free permanent subdomain.
 
 ## Why not just `cloudflared`?
 
@@ -46,10 +73,11 @@ A machine-wide registry at `~/.cfld/registry.json` indexes every tunnel, so you 
 
 | Command | What it does |
 |---|---|
+| `cfld --quick [port]` | Instant `trycloudflare.com` URL — no account, no cert/domain (temporary). |
+| `cfld setup` | Guided first-run — pick the instant free URL or set up a persistent one. |
 | `cfld [port]` | Ensure + run a persistent tunnel (reuses the same URL). |
-| `cfld --quick [port]` | Ephemeral `trycloudflare.com` URL — no cert/domain. |
 | `cfld login [--reauth]` | Authorize with Cloudflare in your browser. `--reauth` adds another domain. |
-| `cfld init` | Interactive setup wizard — configure a project without running it. |
+| `cfld init` | Configure a persistent tunnel without running it. |
 | `cfld list` | List all tunnels across projects/domains. |
 | `cfld status [name]` | Show details for a tunnel. |
 | `cfld up <name>` | Run a registered tunnel by name from anywhere. |
