@@ -113,6 +113,33 @@ cfld service uninstall    # stop + remove (tunnel + DNS preserved)
 
 Windows service management is not supported — run `cfld` in the foreground there.
 
+## Running alongside your dev server
+
+`cfld` only needs the port your app listens on, and it tolerates the app not being up yet (requests 502 until it starts, then recover). The simplest way to run both with one command is [`concurrently`](https://www.npmjs.com/package/concurrently):
+
+```jsonc
+{
+  "scripts": {
+    "dev": "next dev",                                                    // your app on :3000
+    "dev:tunnel": "concurrently -k -n app,cfld -c blue,magenta \"npm:dev\" \"cfld 3000\""
+  }
+}
+```
+
+```bash
+npm run dev:tunnel
+```
+
+`-k` (kill-others) makes a single Ctrl-C stop both. Because `cfld` reuses the same URL every run and writes it to `.env` as `PUBLIC_URL`, your app can read its own public URL for webhooks/OAuth callbacks.
+
+No extra dependency needed if you prefer plain shell:
+
+```jsonc
+"dev:tunnel": "cfld 3000 & next dev"
+```
+
+> **Tip:** commit a `"cfld": { "zone": "example.com", "name": "myapp" }` block to `package.json` so the URL is deterministic for the whole team, and everyone's `dev:tunnel` maps to `myapp.example.com`.
+
 ## Development
 
 ```bash
