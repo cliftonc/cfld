@@ -1,5 +1,9 @@
 import { parseArgs } from "node:util";
+import { readFileSync, realpathSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import pc from "picocolors";
+import type { DevCommand } from "./process/child.js";
 import { runCommand } from "./commands/run.js";
 import { quickCommand } from "./commands/quick.js";
 import { loginCommand } from "./commands/login.js";
@@ -23,6 +27,48 @@ export interface CliFlags {
   quick?: boolean;
   force?: boolean;
   reauth?: boolean;
+  /** A dev command to run + supervise alongside the tunnel (`-- <cmd>`). */
+  exec?: DevCommand;
+}
+
+/** Best-effort version read from the published package.json (next to dist/). */
+function readVersion(): string {
+  try {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const pkg = JSON.parse(readFileSync(join(here, "../package.json"), "utf8"));
+    return typeof pkg.version === "string" ? pkg.version : "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
+}
+
+/** Split argv at the first bare `--`; everything after is the dev command. */
+export function splitAtDoubleDash(rawArgv: string[]): {
+  argv: string[];
+  afterDash: string[];
+} {
+  const i = rawArgv.indexOf("--");
+  if (i === -1) return { argv: rawArgv, afterDash: [] };
+  return { argv: rawArgv.slice(0, i), afterDash: rawArgv.slice(i + 1) };
+}
+
+/**
+ * Turn the two supported forms into a single {@link DevCommand}. The `-- <cmd>`
+ * argv form runs directly (no shell, no quoting surprises); `--exec "<str>"`
+ * runs through a shell for pipes/globs. They're mutually exclusive.
+ */
+export function resolveExec(
+  afterDash: string[],
+  execFlag: string | undefined,
+): DevCommand | undefined {
+  const hasArgv = afterDash.length > 0;
+  const hasShell = execFlag !== undefined && execFlag.trim() !== "";
+  if (hasArgv && hasShell) {
+    throw new Error("Use either `-- <cmd>` or `--exec \"<cmd>\"`, not both.");
+  }
+  if (hasArgv) return { shell: false, argv: afterDash };
+  if (hasShell) return { shell: true, command: execFlag!.trim() };
+  return undefined;
 }
 
 const SUBCOMMANDS = new Set([
@@ -41,6 +87,7 @@ const HELP = `${pc.bold("cfld")} — persistent Cloudflare tunnels for local dev
 
 ${pc.bold("Usage")}
   cfld [port]              Ensure + run a persistent tunnel (reuses the same URL)
+  cfld [port] -- <cmd>     Run + supervise your dev server too (one lifecycle)
   cfld --quick [port]      Ephemeral trycloudflare.com URL (no domain needed)
   cfld login [--reauth]    Authorize with Cloudflare in your browser
   cfld init                Interactive setup wizard (configure, don't run)
@@ -57,12 +104,22 @@ ${pc.bold("Options")}
   --zone <domain>   Cloudflare domain to use (e.g. example.com)
   --env <KEY>       .env key to write the URL to (default: PUBLIC_URL)
   --no-env          Don't write the URL to .env
+  --exec <cmd>      Dev command to run + supervise (shell form of \`-- <cmd>\`)
   --force           Skip confirmation (destroy)
   -h, --help        Show this help
   -v, --version     Show version
+
+${pc.bold("Examples")}
+  cfld 3000 -- next dev            Start Next.js + the tunnel; one Ctrl-C stops both
+  cfld 5173 --exec "npm run dev"   Same, via a shell command string
 `;
 
-async function main(argv: string[]): Promise<void> {
+async function main(rawArgv: string[]): Promise<void> {
+  // Everything after the first bare `--` is the user's dev command — split it
+  // off before parseArgs so its own flags (e.g. `vite --port 3000`) are never
+  // interpreted as cfld options.
+  const { argv, afterDash } = splitAtDoubleDash(rawArgv);
+
   const { values, positionals } = parseArgs({
     args: argv,
     allowPositionals: true,
@@ -72,6 +129,7 @@ async function main(argv: string[]): Promise<void> {
       zone: { type: "string" },
       env: { type: "string" },
       "no-env": { type: "boolean" },
+      exec: { type: "string" },
       quick: { type: "boolean" },
       force: { type: "boolean" },
       reauth: { type: "boolean" },
@@ -81,7 +139,7 @@ async function main(argv: string[]): Promise<void> {
   });
 
   if (values.version) {
-    process.stdout.write("cfld 0.1.0\n");
+    process.stdout.write(`cfld ${readVersion()}\n`);
     return;
   }
   if (values.help) {
@@ -98,9 +156,16 @@ async function main(argv: string[]): Promise<void> {
     quick: values.quick,
     force: values.force,
     reauth: values.reauth,
+    exec: resolveExec(afterDash, values.exec),
   };
 
   const [first, ...rest] = positionals;
+
+  if (flags.exec && first && SUBCOMMANDS.has(first)) {
+    throw new Error(
+      `A dev command (\`-- …\` / --exec) can't be combined with \`cfld ${first}\`. Use \`cfld [port] -- <cmd>\`.`,
+    );
+  }
 
   // Subcommand dispatch.
   if (first && SUBCOMMANDS.has(first)) {
@@ -150,7 +215,20 @@ async function main(argv: string[]): Promise<void> {
   }
 }
 
-main(process.argv.slice(2)).catch((err) => {
-  printError(err);
-  process.exit(1);
-});
+/** True only when this module is the process entry point (not imported by a test). */
+function invokedDirectly(): boolean {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return realpathSync(entry) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (invokedDirectly()) {
+  main(process.argv.slice(2)).catch((err) => {
+    printError(err);
+    process.exit(1);
+  });
+}

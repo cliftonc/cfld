@@ -1,6 +1,6 @@
 {
   "name": "@cliftonc/cfld",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Zero-token, persistent Cloudflare tunnel CLI for local dev — same public HTTPS URL every run.",
   "type": "module",
   "bin": {

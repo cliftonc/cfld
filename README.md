@@ -115,30 +115,57 @@ Windows service management is not supported — run `cfld` in the foreground the
 
 ## Running alongside your dev server
 
-`cfld` only needs the port your app listens on, and it tolerates the app not being up yet (requests 502 until it starts, then recover). The simplest way to run both with one command is [`concurrently`](https://www.npmjs.com/package/concurrently):
+Give `cfld` your dev command after a `--` and it runs both as one managed unit:
+
+```bash
+cfld 3000 -- next dev
+```
+
+`cfld` will:
+
+- **boot your dev server** as a managed child, with `PUBLIC_URL` already in its environment (so it can read its own public URL for webhooks/OAuth callbacks — no `.env` round-trip needed);
+- **wait for `:3000` to actually listen** before flipping to `● LIVE`, so the URL never serves a 502 the moment you reveal it;
+- **stream your dev server's logs** into the same dashboard as the tunnel — one unified view;
+- **stop both on a single Ctrl-C**, gracefully, leaving the tunnel + DNS intact so the next run reuses the same URL;
+- **exit if your dev server exits**, propagating its exit code (the tunnel is still preserved).
+
+The pass-through form (`-- <cmd>`) runs your command directly. If you need shell features (pipes, `&&`, globs), use the string form instead:
+
+```bash
+cfld 5173 --exec "npm run dev"
+```
+
+This works with `--quick` too, when you don't have a domain set up yet:
+
+```bash
+cfld --quick 3000 -- next dev
+```
+
+Wire it into `package.json` so the whole team gets the same public URL:
 
 ```jsonc
 {
   "scripts": {
-    "dev": "next dev",                                                    // your app on :3000
-    "dev:tunnel": "concurrently -k -n app,cfld -c blue,magenta \"npm:dev\" \"cfld 3000\""
+    "dev": "next dev",
+    "dev:tunnel": "cfld 3000 -- next dev"
   }
 }
 ```
 
-```bash
-npm run dev:tunnel
-```
+> **Tip:** commit a `"cfld": { "zone": "example.com", "name": "myapp" }` block to `package.json` so the URL is deterministic for the whole team — everyone's `dev:tunnel` maps to `myapp.example.com`.
 
-`-k` (kill-others) makes a single Ctrl-C stop both. Because `cfld` reuses the same URL every run and writes it to `.env` as `PUBLIC_URL`, your app can read its own public URL for webhooks/OAuth callbacks.
+<details>
+<summary>Prefer to keep the two processes separate?</summary>
 
-No extra dependency needed if you prefer plain shell:
+`cfld` also works fine standalone — it only needs the port, and tolerates the app not being up yet (502 until it starts, then recovers). Run them with [`concurrently`](https://www.npmjs.com/package/concurrently):
 
 ```jsonc
-"dev:tunnel": "cfld 3000 & next dev"
+"dev:tunnel": "concurrently -k -n app,cfld -c blue,magenta \"npm:dev\" \"cfld 3000\""
 ```
 
-> **Tip:** commit a `"cfld": { "zone": "example.com", "name": "myapp" }` block to `package.json` so the URL is deterministic for the whole team, and everyone's `dev:tunnel` maps to `myapp.example.com`.
+or plain shell: `cfld 3000 & next dev`.
+
+</details>
 
 ## Development
 

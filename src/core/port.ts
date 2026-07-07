@@ -33,6 +33,31 @@ export async function detectDevPorts(): Promise<number[]> {
   return checks.filter((p): p is number => p !== null);
 }
 
+/**
+ * Poll until something is listening on `port`, so a managed dev server can be
+ * given time to boot before we flip the dashboard to LIVE (no 502 window).
+ * Returns true once it's up; false on timeout or abort — the caller decides
+ * whether to proceed or bail.
+ */
+export async function waitForPort(
+  port: number,
+  opts: { timeoutMs?: number; intervalMs?: number; signal?: AbortSignal } = {},
+): Promise<boolean> {
+  const timeoutMs = opts.timeoutMs ?? 120_000;
+  const intervalMs = opts.intervalMs ?? 300;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (opts.signal?.aborted) return false;
+    if (await isPortListening(port)) return true;
+    await sleep(intervalMs);
+  }
+  return false;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 /** Find a free localhost port for the cloudflared metrics endpoint. */
 export function findFreePort(): Promise<number> {
   return new Promise((resolve, reject) => {

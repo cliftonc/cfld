@@ -11,11 +11,18 @@ import {
 } from "../core/hostname.js";
 import type { IngressRoute } from "../core/config-file.js";
 import { detectDevPorts } from "../core/port.js";
-import { findFreePort } from "../core/port.js";
+import { findFreePort, waitForPort } from "../core/port.js";
 import { readProjectConfig, writeProjectConfig } from "../core/project-config.js";
 import { listEntries } from "../core/registry.js";
 import { upsertEnv } from "../core/env-writer.js";
-import { startRunner } from "../process/runner.js";
+import { startRunner, type Runner } from "../process/runner.js";
+import {
+  startChild,
+  describeCommand,
+  reapChild,
+  type ManagedChild,
+  type DevCommand,
+} from "../process/child.js";
 import { waitForReady, scrapeMetrics } from "../process/ready.js";
 import { formatLogLine } from "../process/logs.js";
 import type { DashboardHandle } from "../ui/dashboard.js";
@@ -37,6 +44,20 @@ export async function runCommand(flags: CliFlags): Promise<void> {
   const cwd = process.cwd();
   const interactive = isInteractive();
   const config = readProjectConfig(cwd);
+
+  // With a supervised dev command the port isn't listening yet, so it can't be
+  // auto-detected — require it up front.
+  if (
+    flags.exec &&
+    flags.port === undefined &&
+    config?.port === undefined &&
+    !config?.routes?.length
+  ) {
+    throw new CfldError(
+      "Specify the port your dev command will listen on.",
+      "e.g. `cfld 3000 -- next dev`",
+    );
+  }
 
   const slug = deriveSlug(cwd, flags.name ?? config?.name);
   const tunnelName = tunnelNameForSlug(slug);
@@ -89,12 +110,24 @@ export async function runCommand(flags: CliFlags): Promise<void> {
   });
   if (ensureGitignored(cwd, ".cfld.json")) info("Added .cfld.json to .gitignore.");
 
-  await launch(result, { cwd, envKey, noEnv: flags.noEnv, port: primary.port });
+  await launch(result, {
+    cwd,
+    envKey,
+    noEnv: flags.noEnv,
+    port: primary.port,
+    exec: flags.exec,
+  });
 }
 
 export async function launch(
   result: Awaited<ReturnType<typeof reconcile>>,
-  ctx: { cwd: string; envKey: string; noEnv?: boolean; port: number },
+  ctx: {
+    cwd: string;
+    envKey: string;
+    noEnv?: boolean;
+    port: number;
+    exec?: DevCommand;
+  },
 ): Promise<void> {
   const metricsPort = await findFreePort();
   const url = `https://${result.hostname}`;
@@ -112,7 +145,10 @@ export async function launch(
       status: "connecting",
       connections: 0,
       requests: 0,
-      logs: [],
+      split: Boolean(ctx.exec),
+      devLabel: ctx.exec ? describeCommand(ctx.exec) : undefined,
+      tunnelLogs: [],
+      devLogs: [],
     });
   } else {
     step("Connecting to Cloudflare edge…");
@@ -121,12 +157,41 @@ export async function launch(
   const emitLine = (line: string) => {
     const formatted = formatLogLine(line);
     if (!formatted) return;
-    if (dashboard) dashboard.log(formatted);
+    if (dashboard) dashboard.log(formatted, "tunnel");
     else process.stderr.write(formatted + "\n");
   };
 
-  let stopping = false;
-  const runner = await startRunner({
+  // Dev-server output is already the developer's own formatting — pass it
+  // through verbatim (unlike cloudflared's structured lines) into its own pane.
+  const emitDevLine = (line: string) => {
+    if (line.trim() === "") return;
+    if (dashboard) dashboard.log(line, "dev");
+    else process.stderr.write(line + "\n");
+  };
+
+  let runner: Runner | undefined;
+  let child: ManagedChild | undefined;
+  let poll: ReturnType<typeof setInterval> | undefined;
+  let shuttingDown = false;
+  const childAbort = new AbortController();
+
+  // Single choke point for teardown — stops the dev server AND the tunnel, but
+  // never deletes the tunnel/DNS. `code` propagates a crashed child's status.
+  // We wait for the dev server's whole process group to actually die before
+  // exiting, so no workers are left orphaned.
+  const shutdown = (opts: { reason?: string; code?: number } = {}) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    if (poll) clearInterval(poll);
+    runner?.stop();
+    dashboard?.stop();
+    if (opts.reason) note(`\n${opts.reason}`);
+    const exit = () => setTimeout(() => process.exit(opts.code ?? 0), 100).unref();
+    if (child) reapChild(child).then(exit);
+    else exit();
+  };
+
+  runner = await startRunner({
     configPath: result.configPath,
     tunnelName: result.tunnelName,
     certPath: result.certPath,
@@ -137,35 +202,61 @@ export async function launch(
       else if (status === "connecting" && !dashboard) note("Reconnecting…");
     },
     onFatal: (message) => {
-      dashboard?.stop();
       warn(message);
-      process.exit(1);
+      shutdown({ code: 1 });
     },
   });
 
-  const stop = (reason: string) => {
-    if (stopping) return;
-    stopping = true;
-    runner.stop();
-    dashboard?.stop();
-    note(`\n${reason}`);
-    setTimeout(() => process.exit(0), 100).unref();
-  };
+  // Start the supervised dev server (if any) so it boots while the tunnel
+  // connects. It gets the public URL in its environment immediately.
+  if (ctx.exec) {
+    if (!dashboard) step(`Starting \`${describeCommand(ctx.exec)}\`…`);
+    child = startChild({
+      command: ctx.exec,
+      cwd: ctx.cwd,
+      env: ctx.noEnv ? undefined : { [ctx.envKey]: url },
+      onLine: (line) => emitDevLine(line),
+      onExit: (code, signal) => {
+        childAbort.abort();
+        const how =
+          code !== null ? `exited (code ${code})` : `was terminated${signal ? ` (${signal})` : ""}`;
+        shutdown({
+          reason: `Your dev command ${how} — stopping. Your tunnel URL is preserved.`,
+          code: code ?? 1,
+        });
+      },
+    });
+  }
 
   // Non-TTY: our own SIGINT handler. TTY: ink owns Ctrl-C (see waitUntilExit).
   if (!dashboard) {
-    process.once("SIGINT", () => stop("Stopping — your URL is preserved. Re-run `cfld`."));
-    process.once("SIGTERM", () => stop("Stopping — your URL is preserved."));
+    process.once("SIGINT", () =>
+      shutdown({ reason: "Stopping — your URL is preserved. Re-run `cfld`." }),
+    );
+    process.once("SIGTERM", () =>
+      shutdown({ reason: "Stopping — your URL is preserved." }),
+    );
   }
 
   const ready = await waitForReady(metricsPort).catch((err) => {
-    runner.stop();
+    child?.stop();
+    runner?.stop();
     dashboard?.stop();
     throw new CfldError(
       "The tunnel did not connect.",
       err instanceof Error ? err.message : undefined,
     );
   });
+
+  // Hold LIVE until the dev server is actually accepting connections, so the
+  // URL never shows a 502 the moment it's revealed.
+  if (child && !shuttingDown) {
+    if (dashboard) dashboard.update({ status: "waiting", connections: ready.connections });
+    else step(`Waiting for your dev server on :${ctx.port}…`);
+    const up = await waitForPort(ctx.port, { signal: childAbort.signal });
+    if (shuttingDown) return; // the child died while we waited
+    if (!up) warn(`Nothing is listening on :${ctx.port} yet — going live anyway.`);
+  }
 
   if (!ctx.noEnv) {
     const { changed } = upsertEnv(join(ctx.cwd, ".env"), ctx.envKey, url);
@@ -179,7 +270,7 @@ export async function launch(
   }
 
   // Poll metrics to keep the live counters fresh (fast in the dashboard).
-  const poll = setInterval(async () => {
+  poll = setInterval(async () => {
     const m = await scrapeMetrics(metricsPort);
     if (m && dashboard) {
       dashboard.update({
@@ -195,8 +286,7 @@ export async function launch(
   // gracefully, preserving the tunnel + DNS.
   if (dashboard) {
     await dashboard.waitUntilExit();
-    clearInterval(poll);
-    stop("Stopping — your URL is preserved. Re-run `cfld` to resume.");
+    shutdown({ reason: "Stopping — your URL is preserved. Re-run `cfld` to resume." });
   }
 }
 
