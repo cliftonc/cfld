@@ -1,5 +1,7 @@
 # cfld
 
+**`cfld` = cloudflare local dev.**
+
 **One command to give your localhost a permanent public HTTPS URL — no API tokens, no teardown.**
 
 `cfld` wraps [`cloudflared`](https://github.com/cloudflare/cloudflared) into a frictionless dev experience: the **same** custom URL every run (not a random `trycloudflare.com` one), authorized with a **browser login** (zero API tokens), reusing the same named tunnel and DNS record across restarts instead of churning them. It runs a **live dashboard** (URL, connection count, request/latency counters, tailing logs), **auto-reconnects** on edge blips, and **guards** against stealing a DNS record that belongs to another tunnel.
