@@ -179,6 +179,12 @@ function Dashboard(state: DashboardState): React.ReactElement {
 export interface DashboardHandle {
   update(partial: Partial<DashboardState>): void;
   log(line: string, source?: LogSource): void;
+  /**
+   * Temporarily tear down the live view to run an interactive prompt on the
+   * normal screen (ink's raw-mode render and a prompt can't share the tty), then
+   * restore the dashboard. Used for the rare DNS-overwrite confirmation.
+   */
+  suspend<T>(fn: () => Promise<T>): Promise<T>;
   /** Resolves when the user exits (Ctrl-C). */
   waitUntilExit(): Promise<void>;
   stop(): void;
@@ -198,14 +204,23 @@ export function startDashboard(initial: DashboardState): DashboardHandle {
     devLogs: [...initial.devLogs],
   };
 
+  // `instance` is reassignable: suspend() unmounts and remounts a fresh render
+  // around an interactive prompt, so every method reads the current instance.
+  const mount = () =>
+    render(<Dashboard {...state} />, {
+      stdout: process.stdout,
+      // We drive graceful shutdown ourselves; ink's Ctrl-C simply resolves
+      // waitUntilExit, and the caller then stops the runner (preserving state).
+      exitOnCtrlC: true,
+    });
+
   process.stdout.write(ENTER_ALT_SCREEN);
-  const instance = render(<Dashboard {...state} />, {
-    stdout: process.stdout,
-    // We drive graceful shutdown ourselves; ink's Ctrl-C simply resolves
-    // waitUntilExit, and the caller then stops the runner (preserving state).
-    exitOnCtrlC: true,
-  });
-  const rerender = () => instance.rerender(<Dashboard {...state} />);
+  let instance = mount();
+  // While suspended the view is unmounted; buffer state changes without painting.
+  let paused = false;
+  const rerender = () => {
+    if (!paused) instance.rerender(<Dashboard {...state} />);
+  };
 
   let altActive = true;
   const leaveAltScreen = () => {
@@ -216,6 +231,7 @@ export function startDashboard(initial: DashboardState): DashboardHandle {
 
   // On resize, wipe ink's stale frame before repainting at the new dimensions.
   const onResize = () => {
+    if (paused) return;
     instance.clear();
     rerender();
   };
@@ -235,6 +251,20 @@ export function startDashboard(initial: DashboardState): DashboardHandle {
         state.tunnelLogs = [...state.tunnelLogs, line].slice(-MAX_BUFFER);
       }
       rerender();
+    },
+    async suspend(fn) {
+      paused = true;
+      instance.unmount();
+      leaveAltScreen();
+      try {
+        return await fn();
+      } finally {
+        process.stdout.write(ENTER_ALT_SCREEN);
+        altActive = true;
+        instance = mount();
+        paused = false;
+        rerender();
+      }
     },
     waitUntilExit() {
       return instance.waitUntilExit();

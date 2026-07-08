@@ -2,7 +2,6 @@ import { reconcile } from "../core/state-machine.js";
 import { resolveCert } from "../core/cert-store.js";
 import { getEntry } from "../core/registry.js";
 import { CfldError } from "../util/errors.js";
-import { done, step } from "../ui/output.js";
 import { launch } from "./run.js";
 
 /**
@@ -30,23 +29,27 @@ export async function upCommand(name: string): Promise<void> {
   const routes = entry.routes?.length
     ? entry.routes
     : [{ hostname: entry.hostname, port: entry.port }];
-  const result = await reconcile(
-    {
-      slug,
-      tunnelName: entry.name,
-      zone: entry.zone,
-      certPath: cert,
-      routes,
-      projectDir: entry.projectDir,
-    },
-    { onStep: (s) => step(s) },
-  );
-  done(result.created ? `Created tunnel ${entry.name}` : `Reusing tunnel ${entry.name}`);
 
-  await launch(result, {
+  await launch({
     cwd: entry.projectDir,
+    slug,
+    zone: entry.zone,
     envKey: "PUBLIC_URL",
     noEnv: true, // don't touch a .env we may not be sitting in
+    url: `https://${entry.hostname}`,
     port: entry.port,
+    tunnelName: entry.name,
+    runReconcile: (events) =>
+      reconcile(
+        {
+          slug,
+          tunnelName: entry.name,
+          zone: entry.zone,
+          certPath: cert,
+          routes,
+          projectDir: entry.projectDir,
+        },
+        events,
+      ),
   });
 }

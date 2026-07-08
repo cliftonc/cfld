@@ -1,6 +1,10 @@
 import { join } from "node:path";
 import type { CliFlags } from "../cli.js";
-import { reconcile } from "../core/state-machine.js";
+import {
+  reconcile,
+  type ReconcileEvents,
+  type ReconcileResult,
+} from "../core/state-machine.js";
 import { listStoredZones } from "../core/cert-store.js";
 import {
   buildHostname,
@@ -83,67 +87,76 @@ export async function runCommand(flags: CliFlags): Promise<void> {
   }
   const primary = routes[0]!;
 
-  // Ensure a per-zone cert (may trigger browser login on first use).
+  // Ensure a per-zone cert (may trigger browser login on first use). This is the
+  // last step that may prompt, so it stays ahead of the dashboard.
   const certPath = await ensureCert(zone, { interactive });
 
-  // Reconcile Cloudflare + local state — reuse or create, never tear down.
-  const result = await reconcile(
-    { slug, tunnelName, zone, certPath, routes, projectDir: cwd, force: flags.force },
-    {
-      onStep: (s) => step(s),
-      confirmOverwrite: interactive
-        ? (h, t) => askConfirm(`${h} already points to ${t}. Repoint it to this tunnel?`)
-        : undefined,
-    },
-  );
-  done(result.created ? `Created tunnel ${tunnelName}` : `Reusing tunnel ${tunnelName}`);
-  for (const r of routes) done(`DNS ${r.hostname} → :${r.port}`);
-
-  // Persist the project pointer, and keep the machine-local cache out of git.
-  writeProjectConfig(cwd, {
-    name: slug,
-    zone,
-    uuid: result.uuid,
-    hostname: primary.hostname,
-    port: primary.port,
-    envKey,
-  });
-  if (ensureGitignored(cwd, ".cfld.json")) info("Added .cfld.json to .gitignore.");
-
-  await launch(result, {
+  // The public URL is knowable before the tunnel exists, so the dashboard can
+  // mount and the dev server can boot while we reconcile Cloudflare in parallel.
+  await launch({
     cwd,
+    slug,
+    zone,
     envKey,
     noEnv: flags.noEnv,
     noUi: flags.noUi,
+    url: `https://${primary.hostname}`,
     port: primary.port,
+    tunnelName,
     exec: flags.exec,
+    runReconcile: (events) =>
+      reconcile(
+        { slug, tunnelName, zone, certPath, routes, projectDir: cwd, force: flags.force },
+        events,
+      ),
+    onReconciled: (result, notify) => {
+      // Persist the project pointer, and keep the machine-local cache out of git.
+      writeProjectConfig(cwd, {
+        name: slug,
+        zone,
+        uuid: result.uuid,
+        hostname: primary.hostname,
+        port: primary.port,
+        envKey,
+      });
+      if (ensureGitignored(cwd, ".cfld.json")) notify("Added .cfld.json to .gitignore.");
+    },
   });
 }
 
-export async function launch(
-  result: Awaited<ReturnType<typeof reconcile>>,
-  ctx: {
-    cwd: string;
-    envKey: string;
-    noEnv?: boolean;
-    noUi?: boolean;
-    port: number;
-    exec?: DevCommand;
-  },
-): Promise<void> {
-  const metricsPort = await findFreePort();
-  const url = `https://${result.hostname}`;
+export interface LaunchContext {
+  cwd: string;
+  slug: string;
+  zone: string;
+  envKey: string;
+  noEnv?: boolean;
+  noUi?: boolean;
+  /** The public URL — known before the tunnel exists, from the hostname. */
+  url: string;
+  port: number;
+  tunnelName: string;
+  exec?: DevCommand;
+  /** Reconcile Cloudflare + local state; wired to the UI's progress + prompts. */
+  runReconcile: (events: ReconcileEvents) => Promise<ReconcileResult>;
+  /** Called once the tunnel is reconciled, to persist any project state. */
+  onReconciled?: (result: ReconcileResult, notify: (msg: string) => void) => void;
+}
+
+export async function launch(ctx: LaunchContext): Promise<void> {
+  const url = ctx.url;
   const target = `localhost:${ctx.port}`;
   const interactive = isInteractive() && !ctx.noUi;
 
-  // Interactive → mount the ink dashboard (lazy chunk). Non-TTY → linear.
+  // Mount the UI first so tunnel setup streams live inside it, rather than
+  // scrolling a wall of linear steps before anything appears. Interactive →
+  // the ink dashboard (lazy chunk); non-TTY → linear stderr steps.
   let dashboard: DashboardHandle | undefined;
   if (interactive) {
     const { startDashboard } = await import("../ui/dashboard.js");
     dashboard = startDashboard({
       url,
       target,
-      tunnelName: result.tunnelName,
+      tunnelName: ctx.tunnelName,
       status: "connecting",
       connections: 0,
       requests: 0,
@@ -153,8 +166,12 @@ export async function launch(
       devLogs: [],
     });
   } else {
-    step("Connecting to Cloudflare edge…");
+    step("Setting up your tunnel…");
   }
+
+  // Setup progress goes to the tunnel pane in the dashboard, or linear steps.
+  const setupStep = (s: string) => (dashboard ? dashboard.log(s, "tunnel") : step(s));
+  const setupDone = (s: string) => (dashboard ? dashboard.log(s, "tunnel") : done(s));
 
   const emitLine = (line: string) => {
     const formatted = formatLogLine(line);
@@ -195,24 +212,23 @@ export async function launch(
     else finish();
   };
 
-  runner = await startRunner({
-    configPath: result.configPath,
-    tunnelName: result.tunnelName,
-    certPath: result.certPath,
-    metricsPort,
-    onLine: (line) => emitLine(line),
-    onStatus: (status) => {
-      if (status === "reconnecting") dashboard?.update({ status: "reconnecting" });
-      else if (status === "connecting" && !dashboard) note("Reconnecting…");
-    },
-    onFatal: (message) => {
-      warn(message);
-      shutdown({ code: 1 });
-    },
-  });
+  // Own the shutdown signals up-front — the dev server starts booting below,
+  // before the tunnel is even reconciled, so a Ctrl-C/SIGTERM during setup must
+  // already route through graceful teardown rather than orphan the dev tree.
+  // (In the dashboard, ink's raw mode usually turns Ctrl-C into a keypress; this
+  // covers the cases where a real signal still reaches us.)
+  process.once("SIGINT", () =>
+    shutdown({ reason: "Stopping — your URL is preserved. Re-run `cfld`." }),
+  );
+  process.once("SIGTERM", () =>
+    shutdown({ reason: "Stopping — your URL is preserved." }),
+  );
+  // SIGHUP: the terminal window was closed. Reap the dev tree too, don't orphan.
+  process.once("SIGHUP", () => shutdown({ reason: "Terminal closed — stopping." }));
 
-  // Start the supervised dev server (if any) so it boots while the tunnel
-  // connects. It gets the public URL in its environment immediately.
+  // Boot the supervised dev server (if any) NOW, in parallel with the tunnel
+  // setup below. It already knows its final public URL, so it comes up while we
+  // create + route the tunnel — nothing waits on Cloudflare before it starts.
   if (ctx.exec) {
     if (!dashboard) step(`Starting \`${describeCommand(ctx.exec)}\`…`);
     child = startChild({
@@ -232,19 +248,56 @@ export async function launch(
     });
   }
 
-  // Always own the shutdown signals — even in the dashboard, where ink's raw
-  // mode usually turns Ctrl-C into a keypress. If a real SIGINT/SIGTERM ever
-  // reaches us (some terminals, `kill`, an editor's stop button), the default
-  // action would terminate cfld instantly and orphan the whole dev-server tree.
-  // Installing a handler routes it through the same graceful teardown instead.
-  process.once("SIGINT", () =>
-    shutdown({ reason: "Stopping — your URL is preserved. Re-run `cfld`." }),
+  // Reconcile Cloudflare + local state while the dev server boots. Progress and
+  // the rare DNS-overwrite confirmation are routed through the live UI.
+  const result = await ctx
+    .runReconcile({
+      onStep: (s) => setupStep(s),
+      confirmOverwrite: interactive
+        ? (h, t) => {
+            const ask = () =>
+              askConfirm(`${h} already points to ${t}. Repoint it to this tunnel?`);
+            // The prompt can't share the tty with a live ink render — briefly
+            // drop out of the dashboard to ask, then restore it.
+            return dashboard ? dashboard.suspend(ask) : ask();
+          }
+        : undefined,
+    })
+    .catch(async (err) => {
+      // Setup failed — tear the dashboard down and reap the dev tree before the
+      // error propagates, so a half-started dev server is never orphaned.
+      dashboard?.stop();
+      if (child) await reapChild(child);
+      throw err;
+    });
+
+  if (shuttingDown) return; // the dev server died during setup
+
+  setupDone(
+    result.created ? `Created tunnel ${result.tunnelName}` : `Reusing tunnel ${result.tunnelName}`,
   );
-  process.once("SIGTERM", () =>
-    shutdown({ reason: "Stopping — your URL is preserved." }),
+  for (const r of result.routes) setupDone(`DNS ${r.hostname} → :${r.port}`);
+  ctx.onReconciled?.(result, (msg) =>
+    dashboard ? dashboard.log(msg, "tunnel") : info(msg),
   );
-  // SIGHUP: the terminal window was closed. Reap the dev tree too, don't orphan.
-  process.once("SIGHUP", () => shutdown({ reason: "Terminal closed — stopping." }));
+
+  // The ingress config now exists — start the tunnel supervisor.
+  const metricsPort = await findFreePort();
+  runner = await startRunner({
+    configPath: result.configPath,
+    tunnelName: result.tunnelName,
+    certPath: result.certPath,
+    metricsPort,
+    onLine: (line) => emitLine(line),
+    onStatus: (status) => {
+      if (status === "reconnecting") dashboard?.update({ status: "reconnecting" });
+      else if (status === "connecting" && !dashboard) note("Reconnecting…");
+    },
+    onFatal: (message) => {
+      warn(message);
+      shutdown({ code: 1 });
+    },
+  });
 
   const ready = await waitForReady(metricsPort).catch((err) => {
     child?.stop();
