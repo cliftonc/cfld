@@ -147,27 +147,16 @@ export async function launch(ctx: LaunchContext): Promise<void> {
   const target = `localhost:${ctx.port}`;
   const interactive = isInteractive() && !ctx.noUi;
 
-  // Mount the UI first so tunnel setup streams live inside it, rather than
-  // scrolling a wall of linear steps before anything appears. Interactive →
-  // the ink dashboard (lazy chunk); non-TTY → linear stderr steps.
   let dashboard: DashboardHandle | undefined;
-  if (interactive) {
-    const { startDashboard } = await import("../ui/dashboard.js");
-    dashboard = startDashboard({
-      url,
-      target,
-      tunnelName: ctx.tunnelName,
-      status: "connecting",
-      connections: 0,
-      requests: 0,
-      split: Boolean(ctx.exec),
-      devLabel: ctx.exec ? describeCommand(ctx.exec) : undefined,
-      tunnelLogs: [],
-      devLogs: [],
-    });
-  } else {
-    step("Setting up your tunnel…");
-  }
+  let runner: Runner | undefined;
+  let child: ManagedChild | undefined;
+  let result: ReconcileResult | undefined;
+  let poll: ReturnType<typeof setInterval> | undefined;
+  let metricsPort = 0;
+  let shuttingDown = false;
+  let started = false; // true once the tunnel is live — gates the restart hotkeys
+  let busy = false; // a restart is in flight — serialize them
+  const childAbort = new AbortController();
 
   // Setup progress goes to the tunnel pane in the dashboard, or linear steps.
   const setupStep = (s: string) => (dashboard ? dashboard.log(s, "tunnel") : step(s));
@@ -188,12 +177,6 @@ export async function launch(ctx: LaunchContext): Promise<void> {
     else process.stderr.write(line + "\n");
   };
 
-  let runner: Runner | undefined;
-  let child: ManagedChild | undefined;
-  let poll: ReturnType<typeof setInterval> | undefined;
-  let shuttingDown = false;
-  const childAbort = new AbortController();
-
   // Single choke point for teardown — stops the dev server AND the tunnel, but
   // never deletes the tunnel/DNS. `code` propagates a crashed child's status.
   // We wait for the dev server's whole process group to actually die before
@@ -212,6 +195,80 @@ export async function launch(ctx: LaunchContext): Promise<void> {
     else finish();
   };
 
+  // (Re)spawn the tunnel supervisor on a given metrics port. Extracted so the
+  // `t`/`r` hotkeys can restart it with a fresh port (avoiding a metrics-bind
+  // race with the outgoing process).
+  const startTunnel = (port: number): Promise<Runner> =>
+    startRunner({
+      configPath: result!.configPath,
+      tunnelName: result!.tunnelName,
+      certPath: result!.certPath,
+      metricsPort: port,
+      onLine: (line) => emitLine(line),
+      onStatus: (status) => {
+        if (status === "reconnecting") dashboard?.update({ status: "reconnecting" });
+        else if (status === "connecting" && !dashboard) note("Reconnecting…");
+      },
+      onFatal: (message) => {
+        warn(message);
+        shutdown({ code: 1 });
+      },
+    });
+
+  // (Re)spawn the dev server. It gets the public URL in its environment, and its
+  // exit routes through the same graceful teardown — unless we stopped it on
+  // purpose (reapChild sets its `stopped` flag first), which is how `d`/`r`
+  // restart it without tripping shutdown.
+  const startDevServer = (): ManagedChild =>
+    startChild({
+      command: ctx.exec!,
+      cwd: ctx.cwd,
+      env: ctx.noEnv ? undefined : { [ctx.envKey]: url },
+      onLine: (line) => emitDevLine(line),
+      onExit: (code, signal) => {
+        childAbort.abort();
+        const how =
+          code !== null ? `exited (code ${code})` : `was terminated${signal ? ` (${signal})` : ""}`;
+        shutdown({
+          reason: `Your dev command ${how} — stopping. Your tunnel URL is preserved.`,
+          code: code ?? 1,
+        });
+      },
+    });
+
+  // --- Hotkey actions (dashboard only) -------------------------------------
+  const doRestartDev = async () => {
+    if (!ctx.exec || !child) return;
+    dashboard?.log("↻ restarting dev server…", "dev");
+    await reapChild(child); // stops it cleanly (no shutdown) before respawning
+    if (shuttingDown) return;
+    child = startDevServer();
+  };
+  const doRestartTunnel = async () => {
+    if (!runner || !result) return;
+    dashboard?.log("↻ restarting tunnel…", "tunnel");
+    dashboard?.update({ status: "reconnecting" });
+    runner.stop();
+    metricsPort = await findFreePort();
+    runner = await startTunnel(metricsPort);
+    const r = await waitForReady(metricsPort).catch(() => undefined);
+    if (r && !shuttingDown) dashboard?.update({ status: "live", connections: r.connections });
+  };
+  // Serialize restarts and ignore them until the tunnel is actually up.
+  const guard = (fn: () => Promise<void>) => () => {
+    if (busy || shuttingDown || !started) return;
+    busy = true;
+    void Promise.resolve(fn()).finally(() => {
+      busy = false;
+    });
+  };
+  const restartDev = guard(doRestartDev);
+  const restartTunnel = guard(doRestartTunnel);
+  const restartAll = guard(async () => {
+    await doRestartTunnel();
+    await doRestartDev();
+  });
+
   // Own the shutdown signals up-front — the dev server starts booting below,
   // before the tunnel is even reconciled, so a Ctrl-C/SIGTERM during setup must
   // already route through graceful teardown rather than orphan the dev tree.
@@ -226,31 +283,45 @@ export async function launch(ctx: LaunchContext): Promise<void> {
   // SIGHUP: the terminal window was closed. Reap the dev tree too, don't orphan.
   process.once("SIGHUP", () => shutdown({ reason: "Terminal closed — stopping." }));
 
+  // Mount the UI first so tunnel setup streams live inside it, rather than
+  // scrolling a wall of linear steps before anything appears. Interactive →
+  // the ink dashboard (lazy chunk); non-TTY → linear stderr steps.
+  if (interactive) {
+    const { startDashboard } = await import("../ui/dashboard.js");
+    dashboard = startDashboard(
+      {
+        url,
+        target,
+        tunnelName: ctx.tunnelName,
+        status: "connecting",
+        connections: 0,
+        requests: 0,
+        split: Boolean(ctx.exec),
+        devLabel: ctx.exec ? describeCommand(ctx.exec) : undefined,
+        tunnelLogs: [],
+        devLogs: [],
+      },
+      {
+        restartAll,
+        restartTunnel,
+        restartDev: ctx.exec ? restartDev : undefined,
+      },
+    );
+  } else {
+    step("Setting up your tunnel…");
+  }
+
   // Boot the supervised dev server (if any) NOW, in parallel with the tunnel
   // setup below. It already knows its final public URL, so it comes up while we
   // create + route the tunnel — nothing waits on Cloudflare before it starts.
   if (ctx.exec) {
     if (!dashboard) step(`Starting \`${describeCommand(ctx.exec)}\`…`);
-    child = startChild({
-      command: ctx.exec,
-      cwd: ctx.cwd,
-      env: ctx.noEnv ? undefined : { [ctx.envKey]: url },
-      onLine: (line) => emitDevLine(line),
-      onExit: (code, signal) => {
-        childAbort.abort();
-        const how =
-          code !== null ? `exited (code ${code})` : `was terminated${signal ? ` (${signal})` : ""}`;
-        shutdown({
-          reason: `Your dev command ${how} — stopping. Your tunnel URL is preserved.`,
-          code: code ?? 1,
-        });
-      },
-    });
+    child = startDevServer();
   }
 
   // Reconcile Cloudflare + local state while the dev server boots. Progress and
   // the rare DNS-overwrite confirmation are routed through the live UI.
-  const result = await ctx
+  result = await ctx
     .runReconcile({
       onStep: (s) => setupStep(s),
       confirmOverwrite: interactive
@@ -282,22 +353,8 @@ export async function launch(ctx: LaunchContext): Promise<void> {
   );
 
   // The ingress config now exists — start the tunnel supervisor.
-  const metricsPort = await findFreePort();
-  runner = await startRunner({
-    configPath: result.configPath,
-    tunnelName: result.tunnelName,
-    certPath: result.certPath,
-    metricsPort,
-    onLine: (line) => emitLine(line),
-    onStatus: (status) => {
-      if (status === "reconnecting") dashboard?.update({ status: "reconnecting" });
-      else if (status === "connecting" && !dashboard) note("Reconnecting…");
-    },
-    onFatal: (message) => {
-      warn(message);
-      shutdown({ code: 1 });
-    },
-  });
+  metricsPort = await findFreePort();
+  runner = await startTunnel(metricsPort);
 
   const ready = await waitForReady(metricsPort).catch((err) => {
     child?.stop();
@@ -308,6 +365,7 @@ export async function launch(ctx: LaunchContext): Promise<void> {
       err instanceof Error ? err.message : undefined,
     );
   });
+  started = true; // the tunnel is up — restart hotkeys are now live
 
   // Hold LIVE until the dev server is actually accepting connections, so the
   // URL never shows a 502 the moment it's revealed.
