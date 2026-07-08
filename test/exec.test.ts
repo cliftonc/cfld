@@ -170,4 +170,42 @@ describe("reapChild", () => {
     expect(alive(child.pid!)).toBe(false);
     expect(alive(gcPid)).toBe(false); // the escaped grandchild is gone too
   });
+
+  it("reaps a worker whose parent already exited (reparented to init)", async () => {
+    // The real `pnpm → vite → workerd/esbuild` failure: an intermediate wrapper
+    // spawns a worker in its own group, then EXITS — the worker reparents to
+    // init (PPID 1), so a PPID walk at teardown can no longer reach it from our
+    // leader. It survives ONLY if we recorded its group while the wrapper was
+    // still traceable. Fast poll so the snapshot lands before the wrapper dies.
+    const worker =
+      "const cp=require('node:child_process');" +
+      "const w=cp.spawn(process.execPath,['-e','setInterval(()=>{},1e9)'],{detached:true,stdio:'ignore'});" +
+      "w.unref();" +
+      "process.stdout.write('W '+w.pid+'\\n');" +
+      "setTimeout(()=>process.exit(0),400);"; // wrapper exits → worker reparents to init
+
+    let workerPid = 0;
+    const child = startChild({
+      command: { shell: false, argv: [process.execPath, "-e", worker] },
+      cwd: process.cwd(),
+      pollTreeMs: 50, // capture the worker's group before the wrapper exits
+      onLine: (line) => {
+        const m = line.match(/W (\d+)/);
+        if (m) workerPid = Number(m[1]);
+      },
+    });
+
+    for (let i = 0; i < 100 && workerPid === 0; i++) await wait(20);
+    expect(workerPid).toBeGreaterThan(0);
+    // Let the poll snapshot the tree, then let the wrapper exit so the worker
+    // reparents to init — its PPID chain from our leader is now broken.
+    await wait(250);
+    await child.exited; // wrapper process gone
+    expect(alive(workerPid)).toBe(true); // still alive, now orphaned to init
+
+    await reapChild(child, 1000);
+    await wait(150);
+
+    expect(alive(workerPid)).toBe(false); // reached via its recorded process group
+  });
 });

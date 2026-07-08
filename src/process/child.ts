@@ -7,11 +7,22 @@ import { spawn, execSync, type ChildProcess } from "node:child_process";
  * the caller shut everything down cleanly (leaving the tunnel + DNS intact).
  *
  * The child runs in its OWN process group (`detached`), so the terminal's
- * Ctrl-C does not reach it directly — cfld owns its lifecycle. On teardown we
- * signal both the process group AND every descendant we can find by walking the
- * process tree: wrappers like `pnpm run dev` / `concurrently` / `wrangler`
- * spawn sub-trees that call setsid and escape the original group, so a group
- * signal alone leaves them orphaned (workers stuck on :3000/:3001).
+ * Ctrl-C does not reach it directly — cfld owns its lifecycle.
+ *
+ * Killing the whole tree is the hard part. Wrappers like `pnpm run dev` /
+ * `dotenv-cli -- vite` / `concurrently` spawn workers (vite → workerd, esbuild)
+ * that BOTH (a) reparent to init when their intermediate parent exits — so a
+ * PPID walk done at teardown can no longer reach them from our leader — AND
+ * (b) land in their own process groups, so signalling only the leader's group
+ * misses them. Either escape hatch alone leaves workers orphaned (stuck on
+ * :3000/workerd sockets), and you can't restart.
+ *
+ * The robust invariant we rely on: a process keeps its process-group id even
+ * after it reparents to init. So while the child is alive we POLL its
+ * descendant tree and accumulate every process-group id we ever see it span.
+ * At teardown we signal all of those groups — reaching workers that have since
+ * reparented or setsid'd away, because we recorded their group while their
+ * parent was still traceable.
  */
 
 /** How to launch the dev command: a pre-split argv, or a shell string. */
@@ -32,6 +43,8 @@ export interface ChildOptions {
   onLine?: (line: string, stream: "stdout" | "stderr") => void;
   /** Called once when the child exits (for any reason other than our stop()). */
   onExit?: (code: number | null, signal: NodeJS.Signals | null) => void;
+  /** How often to snapshot the descendant tree's process groups (ms). Test seam. */
+  pollTreeMs?: number;
 }
 
 export interface ManagedChild {
@@ -65,11 +78,27 @@ export function startChild(options: ChildOptions): ManagedChild {
     markExited = resolve;
   });
 
+  // Every process group the child's tree has ever spanned. Populated by polling
+  // while the tree is alive+traceable, so we can still reach workers that later
+  // reparent to init or setsid into their own group (see the file header).
+  const trackedPgids = new Set<number>();
+  const trackTree = () => {
+    const pid = child.pid;
+    if (pid === undefined) return;
+    for (const g of descendantPgids(pid)) {
+      // Never signal our own group (would kill cfld) or init.
+      if (g > 1 && g !== process.pid) trackedPgids.add(g);
+    }
+  };
+  const poll = setInterval(trackTree, options.pollTreeMs ?? 1500);
+  poll.unref();
+
   wireLines(child, "stdout", options.onLine);
   wireLines(child, "stderr", options.onLine);
 
   // ENOENT (command not found) arrives as an 'error' event, not an exit.
   child.on("error", (err) => {
+    clearInterval(poll);
     markExited();
     if (stopped) return;
     stopped = true;
@@ -79,11 +108,22 @@ export function startChild(options: ChildOptions): ManagedChild {
   });
 
   child.on("exit", (code, signal) => {
+    clearInterval(poll);
     markExited();
     if (stopped) return;
     stopped = true;
     options.onExit?.(code, signal);
   });
+
+  // Signal the child's own group plus every group its tree has ever spanned.
+  // Refresh the tracking first so a teardown that races the poll still sees the
+  // current tree.
+  const signalTree = (signal: NodeJS.Signals) => {
+    trackTree();
+    const pid = child.pid;
+    if (pid !== undefined) trySignalGroup(pid, signal);
+    for (const g of trackedPgids) trySignalGroup(g, signal);
+  };
 
   return {
     exited,
@@ -93,104 +133,92 @@ export function startChild(options: ChildOptions): ManagedChild {
     stop() {
       if (stopped) return;
       stopped = true;
-      killGroup(child, "SIGINT");
+      clearInterval(poll);
+      signalTree("SIGINT");
       const t = setTimeout(() => {
-        if (child.exitCode === null && !child.signalCode) killGroup(child, "SIGKILL");
+        if (child.exitCode === null && !child.signalCode) signalTree("SIGKILL");
       }, 4000);
       t.unref();
     },
     kill() {
-      killGroup(child, "SIGKILL");
+      clearInterval(poll);
+      signalTree("SIGKILL");
     },
   };
 }
 
 /**
- * Snapshot every descendant PID of `pid` by walking the live process table.
- * MUST be captured while the tree is still alive — once the leader dies its
- * children reparent to init (PPID 1) and the chain from `pid` is lost.
+ * The set of process-group ids spanned by `pid`'s descendant tree, read from
+ * the live process table. Called repeatedly while the tree is alive so we
+ * accumulate groups before their members reparent to init and the PPID chain
+ * from `pid` breaks — a reparented process keeps its group, so the recorded
+ * group id still reaches it at teardown.
  */
-function descendantPids(pid: number): number[] {
+function descendantPgids(pid: number): number[] {
   let out = "";
   try {
-    out = execSync("ps -A -o pid=,ppid=", { encoding: "utf8" });
+    out = execSync("ps -A -o pid=,ppid=,pgid=", { encoding: "utf8" });
   } catch {
     return [];
   }
   const childrenOf = new Map<number, number[]>();
+  const pgidOf = new Map<number, number>();
   for (const line of out.split("\n")) {
-    const m = line.trim().match(/^(\d+)\s+(\d+)$/);
+    const m = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)$/);
     if (!m) continue;
-    const child = Number(m[1]);
+    const proc = Number(m[1]);
     const parent = Number(m[2]);
+    pgidOf.set(proc, Number(m[3]));
     const list = childrenOf.get(parent);
-    if (list) list.push(child);
-    else childrenOf.set(parent, [child]);
+    if (list) list.push(proc);
+    else childrenOf.set(parent, [proc]);
   }
-  const found: number[] = [];
+  const pgids = new Set<number>();
+  const seen = new Set<number>();
   const stack = [pid];
   while (stack.length) {
     for (const child of childrenOf.get(stack.pop()!) ?? []) {
-      if (!found.includes(child)) {
-        found.push(child);
-        stack.push(child);
-      }
+      if (seen.has(child)) continue;
+      seen.add(child);
+      stack.push(child);
+      const g = pgidOf.get(child);
+      if (g !== undefined) pgids.add(g);
     }
   }
-  return found;
+  return [...pgids];
 }
 
-function signalPids(pids: number[], signal: NodeJS.Signals): void {
-  for (const pid of pids) {
-    try {
-      process.kill(pid, signal);
-    } catch {
-      /* already gone */
-    }
+/**
+ * Signal a whole process group (negative PID). Swallows ESRCH — a group whose
+ * members have all exited is exactly what we want.
+ */
+function trySignalGroup(pgid: number, signal: NodeJS.Signals): void {
+  try {
+    process.kill(-pgid, signal);
+  } catch {
+    /* already gone */
   }
 }
 
 /**
- * Graceful teardown for shutdown: snapshot the whole descendant tree, SIGINT
- * the process group AND that tree, wait for the leader to exit (up to
- * `graceMs`), then SIGKILL both — reaping workers that escaped the group into
- * their own session. Resolves once it's gone, so callers can wait before
- * exiting rather than orphaning children.
+ * Graceful teardown for shutdown: SIGINT the child's group + every group its
+ * tree spanned, wait for the leader to exit (up to `graceMs`), then SIGKILL the
+ * lot — reaping workers that reparented or escaped into their own group.
+ * Resolves once it's gone, so callers can wait before exiting rather than
+ * orphaning children.
  */
 export function reapChild(child: ManagedChild, graceMs = 3000): Promise<void> {
-  // Capture the tree NOW, while everything is still alive and reachable.
-  const tree = child.pid ? descendantPids(child.pid) : [];
-  child.stop(); // SIGINT the group (+ its own SIGKILL escalation)
-  signalPids(tree, "SIGINT"); // reach any subtree that escaped the group
+  child.stop(); // SIGINT the tracked groups (+ its own SIGKILL escalation)
   return new Promise<void>((resolve) => {
     const done = () => {
       clearTimeout(grace);
-      child.kill(); // SIGKILL the group
-      signalPids(tree, "SIGKILL"); // and every descendant we snapshotted
+      child.kill(); // SIGKILL every group we recorded
       resolve();
     };
     const grace = setTimeout(done, graceMs);
     grace.unref();
     child.exited.then(done);
   });
-}
-
-/**
- * Signal the child's entire process group when possible (negative PID), so
- * spawned workers die with it; fall back to the single process.
- */
-function killGroup(child: ChildProcess, signal: NodeJS.Signals): void {
-  const pid = child.pid;
-  if (pid === undefined) return;
-  try {
-    process.kill(-pid, signal);
-  } catch {
-    try {
-      child.kill(signal);
-    } catch {
-      /* already gone */
-    }
-  }
 }
 
 function wireLines(
