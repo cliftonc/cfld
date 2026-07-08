@@ -208,4 +208,43 @@ describe("reapChild", () => {
 
     expect(alive(workerPid)).toBe(false); // reached via its recorded process group
   });
+
+  it("reaps a supervisor that ignores SIGINT and respawns its worker", async () => {
+    // Models `concurrently --restart-tries`: a supervisor that keeps a worker
+    // alive by respawning it, and does not stop on a plain SIGINT. Only the
+    // escalate-to-SIGKILL-and-repeat loop can take the whole tree down; a
+    // one-shot SIGINT would leave it running.
+    const script = [
+      "const cp=require('node:child_process');",
+      "process.on('SIGINT',()=>{});", // stubborn: ignore SIGINT
+      "function spawnW(){",
+      "  const w=cp.spawn(process.execPath,['-e','setInterval(()=>{},1e9)'],{stdio:'ignore'});",
+      "  process.stdout.write('W '+w.pid+'\\n');",
+      "  w.on('exit',()=>setTimeout(spawnW,50));", // respawn on death
+      "}",
+      "spawnW();",
+      "setInterval(()=>{},1e9);",
+    ].join("\n");
+
+    let workerPid = 0;
+    const child = startChild({
+      command: { shell: false, argv: [process.execPath, "-e", script] },
+      cwd: process.cwd(),
+      pollTreeMs: 50,
+      onLine: (line) => {
+        const m = line.match(/W (\d+)/);
+        if (m) workerPid = Number(m[1]);
+      },
+    });
+
+    for (let i = 0; i < 100 && workerPid === 0; i++) await wait(20);
+    expect(workerPid).toBeGreaterThan(0);
+    await wait(200); // let a poll record the group
+
+    await reapChild(child, 1000);
+    await wait(200);
+
+    expect(alive(child.pid!)).toBe(false); // leader killed despite ignoring SIGINT
+    expect(child.treeAlive()).toBe(false); // and no respawned worker survives
+  });
 });

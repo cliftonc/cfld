@@ -24,7 +24,7 @@ import { info, isInteractive, note, step, summaryBox, warn } from "../ui/output.
 export async function quickCommand(flags: CliFlags): Promise<void> {
   const port = await resolvePort(flags);
   const target = `localhost:${port}`;
-  const interactive = isInteractive();
+  const interactive = isInteractive() && !flags.noUi;
   const metricsPort = await findFreePort();
   const envKey = flags.envKey ?? "PUBLIC_URL";
 
@@ -65,9 +65,10 @@ export async function quickCommand(flags: CliFlags): Promise<void> {
     tunnel?.stop();
     dashboard?.stop();
     note(`\n${opts.reason ?? "Stopped ephemeral tunnel."}`);
-    const exit = () => setTimeout(() => process.exit(opts.code ?? 0), 100).unref();
-    if (child) reapChild(child).then(exit);
-    else exit();
+    // Wait for the dev-server tree to be fully reaped before exiting.
+    const finish = () => process.exit(opts.code ?? 0);
+    if (child) reapChild(child).then(finish, finish);
+    else finish();
   };
 
   tunnel = await startQuickTunnel(port, { metricsPort, onLine: emitLine });
@@ -111,11 +112,12 @@ export async function quickCommand(flags: CliFlags): Promise<void> {
     });
   }
 
-  // Non-TTY: our own signal handlers. TTY: ink owns Ctrl-C (see waitUntilExit).
-  if (!dashboard) {
-    process.once("SIGINT", () => shutdown());
-    process.once("SIGTERM", () => shutdown());
-  }
+  // Always own the shutdown signals (even under ink) so a real SIGINT/SIGTERM
+  // routes through graceful teardown instead of terminating cfld and orphaning
+  // the dev-server tree.
+  process.once("SIGINT", () => shutdown());
+  process.once("SIGTERM", () => shutdown());
+  process.once("SIGHUP", () => shutdown());
 
   // Hold LIVE until the dev server is actually accepting connections.
   if (child) {

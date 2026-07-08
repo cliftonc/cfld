@@ -114,6 +114,7 @@ export async function runCommand(flags: CliFlags): Promise<void> {
     cwd,
     envKey,
     noEnv: flags.noEnv,
+    noUi: flags.noUi,
     port: primary.port,
     exec: flags.exec,
   });
@@ -125,6 +126,7 @@ export async function launch(
     cwd: string;
     envKey: string;
     noEnv?: boolean;
+    noUi?: boolean;
     port: number;
     exec?: DevCommand;
   },
@@ -132,7 +134,7 @@ export async function launch(
   const metricsPort = await findFreePort();
   const url = `https://${result.hostname}`;
   const target = `localhost:${ctx.port}`;
-  const interactive = isInteractive();
+  const interactive = isInteractive() && !ctx.noUi;
 
   // Interactive → mount the ink dashboard (lazy chunk). Non-TTY → linear.
   let dashboard: DashboardHandle | undefined;
@@ -186,9 +188,11 @@ export async function launch(
     runner?.stop();
     dashboard?.stop();
     if (opts.reason) note(`\n${opts.reason}`);
-    const exit = () => setTimeout(() => process.exit(opts.code ?? 0), 100).unref();
-    if (child) reapChild(child).then(exit);
-    else exit();
+    // Wait for the dev-server tree to be fully reaped BEFORE exiting — reapChild
+    // keeps the event loop alive until it's gone, so we never orphan workers.
+    const finish = () => process.exit(opts.code ?? 0);
+    if (child) reapChild(child).then(finish, finish);
+    else finish();
   };
 
   runner = await startRunner({
@@ -228,15 +232,19 @@ export async function launch(
     });
   }
 
-  // Non-TTY: our own SIGINT handler. TTY: ink owns Ctrl-C (see waitUntilExit).
-  if (!dashboard) {
-    process.once("SIGINT", () =>
-      shutdown({ reason: "Stopping — your URL is preserved. Re-run `cfld`." }),
-    );
-    process.once("SIGTERM", () =>
-      shutdown({ reason: "Stopping — your URL is preserved." }),
-    );
-  }
+  // Always own the shutdown signals — even in the dashboard, where ink's raw
+  // mode usually turns Ctrl-C into a keypress. If a real SIGINT/SIGTERM ever
+  // reaches us (some terminals, `kill`, an editor's stop button), the default
+  // action would terminate cfld instantly and orphan the whole dev-server tree.
+  // Installing a handler routes it through the same graceful teardown instead.
+  process.once("SIGINT", () =>
+    shutdown({ reason: "Stopping — your URL is preserved. Re-run `cfld`." }),
+  );
+  process.once("SIGTERM", () =>
+    shutdown({ reason: "Stopping — your URL is preserved." }),
+  );
+  // SIGHUP: the terminal window was closed. Reap the dev tree too, don't orphan.
+  process.once("SIGHUP", () => shutdown({ reason: "Terminal closed — stopping." }));
 
   const ready = await waitForReady(metricsPort).catch((err) => {
     child?.stop();

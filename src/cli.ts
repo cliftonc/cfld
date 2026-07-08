@@ -28,6 +28,8 @@ export interface CliFlags {
   quick?: boolean;
   force?: boolean;
   reauth?: boolean;
+  /** Force the plain linear renderer instead of the live ink dashboard. */
+  noUi?: boolean;
   /** A dev command to run + supervise alongside the tunnel (`-- <cmd>`). */
   exec?: DevCommand;
 }
@@ -107,6 +109,7 @@ ${pc.bold("Options")}
   --zone <domain>   Cloudflare domain to use (e.g. example.com)
   --env <KEY>       .env key to write the URL to (default: PUBLIC_URL)
   --no-env          Don't write the URL to .env
+  --no-ui           Plain line-by-line output instead of the live dashboard
   --exec <cmd>      Dev command to run + supervise (shell form of \`-- <cmd>\`)
   --force           Skip confirmation (destroy)
   -h, --help        Show this help
@@ -132,6 +135,7 @@ async function main(rawArgv: string[]): Promise<void> {
       zone: { type: "string" },
       env: { type: "string" },
       "no-env": { type: "boolean" },
+      "no-ui": { type: "boolean" },
       exec: { type: "string" },
       quick: { type: "boolean" },
       force: { type: "boolean" },
@@ -156,6 +160,7 @@ async function main(rawArgv: string[]): Promise<void> {
     zone: values.zone,
     envKey: values.env,
     noEnv: values["no-env"],
+    noUi: values["no-ui"],
     quick: values.quick,
     force: values.force,
     reauth: values.reauth,

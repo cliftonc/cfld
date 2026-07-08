@@ -48,11 +48,13 @@ export interface ChildOptions {
 }
 
 export interface ManagedChild {
-  /** SIGINT the process group, escalating to SIGKILL if it lingers. */
+  /** SIGINT the whole tree — the signal supervisors treat as "stop, don't restart". */
   stop: () => void;
-  /** Force-kill the whole process group now (SIGKILL) — reaps stragglers. */
+  /** SIGKILL every process group the tree spans, now. */
   kill: () => void;
-  /** Resolves when the process has actually exited (for graceful teardown). */
+  /** True while any process group the tree spanned still has a live member. */
+  treeAlive: () => boolean;
+  /** Resolves when the leader process has exited (for graceful teardown). */
   readonly exited: Promise<void>;
   readonly pid: number | undefined;
 }
@@ -78,17 +80,20 @@ export function startChild(options: ChildOptions): ManagedChild {
     markExited = resolve;
   });
 
-  // Every process group the child's tree has ever spanned. Populated by polling
-  // while the tree is alive+traceable, so we can still reach workers that later
-  // reparent to init or setsid into their own group (see the file header).
+  // Every process group the child's tree has ever spanned. Seeded with the
+  // leader's own group and grown by polling while the tree is alive+traceable,
+  // so we can still reach workers that later reparent to init or setsid into
+  // their own group (see the file header). Our own group is never added, so we
+  // can't signal cfld itself.
+  const ownPgid = getpgid(process.pid);
   const trackedPgids = new Set<number>();
+  const track = (g: number) => {
+    if (g > 1 && g !== process.pid && g !== ownPgid) trackedPgids.add(g);
+  };
+  if (child.pid !== undefined) track(child.pid); // the detached leader's group
   const trackTree = () => {
-    const pid = child.pid;
-    if (pid === undefined) return;
-    for (const g of descendantPgids(pid)) {
-      // Never signal our own group (would kill cfld) or init.
-      if (g > 1 && g !== process.pid) trackedPgids.add(g);
-    }
+    if (child.pid === undefined) return;
+    for (const g of descendantPgids(child.pid)) track(g);
   };
   const poll = setInterval(trackTree, options.pollTreeMs ?? 1500);
   poll.unref();
@@ -115,13 +120,11 @@ export function startChild(options: ChildOptions): ManagedChild {
     options.onExit?.(code, signal);
   });
 
-  // Signal the child's own group plus every group its tree has ever spanned.
-  // Refresh the tracking first so a teardown that races the poll still sees the
-  // current tree.
+  // Signal every group the tree has ever spanned. Refresh tracking first so a
+  // teardown racing the poll — or a supervisor that just respawned a child into
+  // its group — still sees the current tree.
   const signalTree = (signal: NodeJS.Signals) => {
     trackTree();
-    const pid = child.pid;
-    if (pid !== undefined) trySignalGroup(pid, signal);
     for (const g of trackedPgids) trySignalGroup(g, signal);
   };
 
@@ -130,15 +133,15 @@ export function startChild(options: ChildOptions): ManagedChild {
     get pid() {
       return child.pid;
     },
+    treeAlive() {
+      if (trackedPgids.size === 0) return false;
+      const live = livePgids();
+      for (const g of trackedPgids) if (live.has(g)) return true;
+      return false;
+    },
     stop() {
-      if (stopped) return;
       stopped = true;
-      clearInterval(poll);
       signalTree("SIGINT");
-      const t = setTimeout(() => {
-        if (child.exitCode === null && !child.signalCode) signalTree("SIGKILL");
-      }, 4000);
-      t.unref();
     },
     kill() {
       clearInterval(poll);
@@ -200,25 +203,60 @@ function trySignalGroup(pgid: number, signal: NodeJS.Signals): void {
   }
 }
 
+/** The process-group id of `pid`, or undefined if it can't be read. */
+function getpgid(pid: number): number | undefined {
+  try {
+    const n = Number(execSync(`ps -o pgid= -p ${pid}`, { encoding: "utf8" }).trim());
+    return Number.isInteger(n) ? n : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Every process-group id with at least one live process, from the process table. */
+function livePgids(): Set<number> {
+  const live = new Set<number>();
+  try {
+    for (const line of execSync("ps -A -o pgid=", { encoding: "utf8" }).split("\n")) {
+      const n = Number(line.trim());
+      if (Number.isInteger(n) && n > 0) live.add(n);
+    }
+  } catch {
+    /* if ps fails, treat as empty — better to exit than hang */
+  }
+  return live;
+}
+
+const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
 /**
- * Graceful teardown for shutdown: SIGINT the child's group + every group its
- * tree spanned, wait for the leader to exit (up to `graceMs`), then SIGKILL the
- * lot — reaping workers that reparented or escaped into their own group.
- * Resolves once it's gone, so callers can wait before exiting rather than
- * orphaning children.
+ * Teardown for shutdown, resilient to supervisors that respawn their children.
+ *
+ * A one-shot "SIGINT then SIGKILL" loses two races: the process can exit before
+ * the SIGKILL lands (orphaning the tree), and a supervisor like `concurrently`
+ * / `nodemon` / `pm2` restarts any child that dies with a non-zero code on a
+ * timer. So we (1) SIGINT the whole tree — the signal `concurrently` treats as
+ * a clean, no-restart stop — then (2) SIGKILL every group the tree spans,
+ * re-scanning and repeating until nothing is left or we hit the deadline.
+ *
+ * The awaited delays keep the event loop alive, so the caller can wait for this
+ * to finish before exiting rather than orphaning children mid-reap.
  */
-export function reapChild(child: ManagedChild, graceMs = 3000): Promise<void> {
-  child.stop(); // SIGINT the tracked groups (+ its own SIGKILL escalation)
-  return new Promise<void>((resolve) => {
-    const done = () => {
-      clearTimeout(grace);
-      child.kill(); // SIGKILL every group we recorded
-      resolve();
-    };
-    const grace = setTimeout(done, graceMs);
-    grace.unref();
-    child.exited.then(done);
-  });
+export async function reapChild(child: ManagedChild, graceMs = 3000): Promise<void> {
+  // 1. Graceful: SIGINT lets the dev server flush and tells supervisors to stop
+  //    (and, for SIGINT specifically, NOT to restart their children).
+  child.stop();
+  await Promise.race([child.exited, delay(Math.min(graceMs, 1200))]);
+
+  // 2. Decisive: SIGKILL every group in the tree, re-scanning each pass so we
+  //    also catch any child a supervisor respawned, until the tree is empty.
+  const deadline = Date.now() + graceMs + 5000;
+  for (;;) {
+    child.kill();
+    if (!child.treeAlive()) return;
+    if (Date.now() >= deadline) return; // give up rather than hang forever
+    await delay(200);
+  }
 }
 
 function wireLines(
