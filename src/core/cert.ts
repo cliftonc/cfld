@@ -51,3 +51,28 @@ export function certHasZone(certPath: string): boolean {
   const token = readCertToken(certPath);
   return Boolean(token?.zoneID);
 }
+
+/**
+ * The zone *name* a cert authorizes, looked up with the cert's own embedded
+ * token — the same authority cloudflared uses for `route dns`, so still no
+ * user-supplied API token. Undefined when offline or the API refuses; callers
+ * must treat that as "unknown", not "mismatch".
+ */
+export async function certZoneName(certPath: string): Promise<string | undefined> {
+  const token = readCertToken(certPath);
+  if (!token?.zoneID || !token.apiToken) return undefined;
+  try {
+    const res = await fetch(
+      `https://api.cloudflare.com/client/v4/zones/${token.zoneID}`,
+      {
+        headers: { Authorization: `Bearer ${token.apiToken}` },
+        signal: AbortSignal.timeout(5000),
+      },
+    );
+    if (!res.ok) return undefined;
+    const body = (await res.json()) as { result?: { name?: string } };
+    return body.result?.name?.toLowerCase();
+  } catch {
+    return undefined;
+  }
+}

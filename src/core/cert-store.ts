@@ -4,7 +4,7 @@ import {
   certStoreDir,
   defaultCertPath,
 } from "../util/paths.js";
-import { certExists } from "./cert.js";
+import { certExists, readCertToken } from "./cert.js";
 
 /**
  * The per-domain cert store: `~/.cfld/certs/<zone>.pem`. cloudflared certs are
@@ -34,12 +34,30 @@ export function listStoredZones(): string[] {
 }
 
 /**
+ * Another stored zone whose cert carries the same zoneID as `certPath`, if any.
+ * Two domain names can't share a zoneID, so a hit means the cert was saved under
+ * the wrong name (or is about to be).
+ */
+export function storedZoneClaiming(certPath: string, except?: string): string | undefined {
+  const zoneID = readCertToken(certPath)?.zoneID;
+  if (!zoneID) return undefined;
+  return listStoredZones().find(
+    (z) => z !== except && readCertToken(certPathForZone(z))?.zoneID === zoneID,
+  );
+}
+
+/**
  * Resolve the cert to use for a zone: the stored per-zone cert if present,
  * otherwise the default `~/.cloudflared/cert.pem` (first-time single-domain
- * setup), otherwise undefined (onboarding required).
+ * setup) unless it is already known to belong to a different stored zone,
+ * otherwise undefined (onboarding required).
  */
 export function resolveCert(zone: string): string | undefined {
-  return storedCertForZone(zone) ?? (certExists(defaultCertPath()) ? defaultCertPath() : undefined);
+  const stored = storedCertForZone(zone);
+  if (stored) return stored;
+  const def = defaultCertPath();
+  if (!certExists(def) || storedZoneClaiming(def, zone)) return undefined;
+  return def;
 }
 
 /**

@@ -1,12 +1,19 @@
 import type { CliFlags } from "../cli.js";
 import { resolveBinary } from "../core/cloudflared.js";
 import { exec } from "../util/exec.js";
-import { importCert, listStoredZones } from "../core/cert-store.js";
-import { certHasZone } from "../core/cert.js";
+import { listStoredZones } from "../core/cert-store.js";
+import { certHasZone, certZoneName } from "../core/cert.js";
 import { readProjectConfig } from "../core/project-config.js";
 import { listEntries } from "../core/registry.js";
-import { defaultCertPath } from "../util/paths.js";
-import { ensureCert, normalizeZone, printZeroZoneGuidance, runLogin } from "./login.js";
+import { certPathForZone, defaultCertPath } from "../util/paths.js";
+import {
+  discardLoginCert,
+  ensureCert,
+  normalizeZone,
+  printZeroZoneGuidance,
+  runLogin,
+  saveCert,
+} from "./login.js";
 import { configureProject } from "./init.js";
 import { quickCommand } from "./quick.js";
 import { runCommand } from "./run.js";
@@ -93,24 +100,30 @@ export async function setupCommand(flags: CliFlags): Promise<void> {
     return;
   }
 
-  await runLogin();
-
-  // The account may have no domain to authorize — the persistent-URL blocker.
-  // Offer the instant path as an offramp instead of a dead end.
-  if (!certHasZone(defaultCertPath())) {
-    printZeroZoneGuidance();
-    if (await askConfirm("Start a temporary quick tunnel now instead?")) {
-      await quickCommand(flags);
-      return;
+  const fresh = await runLogin();
+  let zone: string;
+  try {
+    // The account may have no domain to authorize — the persistent-URL blocker.
+    // Offer the instant path as an offramp instead of a dead end.
+    if (!certHasZone(fresh)) {
+      printZeroZoneGuidance();
+      if (await askConfirm("Start a temporary quick tunnel now instead?")) {
+        await quickCommand(flags);
+        return;
+      }
+      throw new CfldError(
+        "Your Cloudflare account has no domain yet, so a persistent URL isn't possible.",
+        "Add a domain (see above), then run `cfld setup` again.",
+      );
     }
-    throw new CfldError(
-      "Your Cloudflare account has no domain yet, so a persistent URL isn't possible.",
-      "Add a domain (see above), then run `cfld setup` again.",
-    );
-  }
 
-  const zone = await askAuthorizedZone(knownZones);
-  const certPath = importCert(zone);
+    // Learn the domain from the cert itself; only ask if the lookup fails.
+    const detected = await certZoneName(fresh);
+    zone = await saveCert(detected ?? (await askAuthorizedZone(knownZones)), fresh);
+  } finally {
+    discardLoginCert(fresh);
+  }
+  const certPath = certPathForZone(zone);
   info(`Saved cert for ${zone}.`);
 
   await configureProject(flags, { zone, certPath, cwd });

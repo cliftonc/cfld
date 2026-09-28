@@ -2,9 +2,9 @@ import pc from "picocolors";
 import { resolveBinary } from "../core/cloudflared.js";
 import { exec } from "../util/exec.js";
 import { listStoredZones } from "../core/cert-store.js";
-import { certExists, certHasZone } from "../core/cert.js";
+import { certExists, certHasZone, certZoneName } from "../core/cert.js";
 import { listEntries } from "../core/registry.js";
-import { defaultCertPath } from "../util/paths.js";
+import { certPathForZone, defaultCertPath } from "../util/paths.js";
 
 /** Diagnostics: binary, certs, registry — a quick "is my setup healthy?" check. */
 export async function doctorCommand(): Promise<void> {
@@ -39,6 +39,16 @@ export async function doctorCommand(): Promise<void> {
   const zones = listStoredZones();
   if (zones.length) out(`  ${ok} cert store: ${zones.join(", ")}`);
   else out(`  ${pc.dim("·")} cert store empty`);
+
+  // Each stored cert must actually be for the zone it's filed under.
+  for (const zone of zones) {
+    const actual = await certZoneName(certPathForZone(zone));
+    if (actual && actual !== zone) {
+      out(
+        `  ${bad} ${zone}.pem is really a cert for ${actual} — fix with \`cfld login --reauth --zone ${zone}\``,
+      );
+    }
+  }
 
   // Registry
   const entries = listEntries();
