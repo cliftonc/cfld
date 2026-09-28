@@ -154,8 +154,11 @@ function LogColumn({
         {lines.length === 0 ? (
           <Text dimColor>{placeholder}</Text>
         ) : (
+          // Wrap rather than truncate so long lines (e.g. magic-link / OAuth
+          // URLs) stay fully visible and selectable instead of ending in "…".
+          // The bottom-pinned box clips older wrapped lines off the top.
           lines.slice(-rows).map((line, i) => (
-            <Text key={i} wrap="truncate-end">
+            <Text key={i} wrap="wrap">
               {line}
             </Text>
           ))
