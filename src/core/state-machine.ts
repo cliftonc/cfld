@@ -1,4 +1,5 @@
-import { existsSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, renameSync, unlinkSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { credentialsPath } from "../util/paths.js";
 import {
   createTunnel,
@@ -70,15 +71,17 @@ export async function reconcile(
   let created = false;
   if (existing) {
     uuid = existing.id;
-    // Ensure run credentials are present locally; refetch if the JSON is gone.
-    if (!existsSync(credentialsPath(uuid))) {
-      step("Refetching tunnel credentials");
-      await fetchToken(tunnelName, credentialsPath(uuid), certPath);
-    }
   } else {
     step(`Creating tunnel ${tunnelName}`);
     uuid = await createTunnel(tunnelName, certPath);
     created = true;
+  }
+  // Ensure run credentials are where the ingress config points; refetch if the JSON is gone.
+  if (!existsSync(credentialsPath(uuid))) {
+    if (!adoptCredentialsBesideCert(uuid, certPath)) {
+      step("Refetching tunnel credentials");
+      await fetchToken(tunnelName, credentialsPath(uuid), certPath);
+    }
   }
 
   // 2. Route DNS for every hostname, guarding each against theft.
@@ -138,4 +141,24 @@ export async function reconcile(
 
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+/**
+ * `cloudflared tunnel create` writes `<uuid>.json` beside the `--origincert` it was given, so a
+ * per-zone cert in the cfld cert store leaves the credentials there, not in the cloudflared dir
+ * the ingress config points at. Move them across. Returns false when there is nothing to adopt.
+ */
+function adoptCredentialsBesideCert(uuid: string, certPath: string): boolean {
+  const beside = join(dirname(certPath), `${uuid}.json`);
+  const target = credentialsPath(uuid);
+  if (beside === target || !existsSync(beside)) return false;
+  mkdirSync(dirname(target), { recursive: true });
+  try {
+    renameSync(beside, target);
+  } catch {
+    // Across filesystems a rename fails: copy, then remove the original.
+    copyFileSync(beside, target);
+    unlinkSync(beside);
+  }
+  return true;
 }

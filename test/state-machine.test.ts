@@ -62,9 +62,40 @@ const input = () => ({
 });
 
 describe("reconcile", () => {
-  it("creates a tunnel when none exists, then routes DNS", async () => {
+  it("moves credentials cloudflared wrote beside a per-zone cert to where the config points", async () => {
+    // `tunnel create --origincert ~/.cfld/certs/<zone>.pem` writes <uuid>.json in ~/.cfld/certs.
+    const certDir = join(home, ".cfld", "certs");
+    mkdirSync(certDir, { recursive: true });
+    const certPath = join(certDir, "example.com.pem");
+    findTunnel.mockResolvedValue(undefined);
+    createTunnel.mockImplementation(async () => {
+      writeFileSync(join(certDir, `${UUID}.json`), '{"TunnelID":"x"}');
+      return UUID;
+    });
+
+    await reconcile({ ...input(), certPath });
+
+    expect(readFileSync(credsFile(UUID), "utf8")).toBe('{"TunnelID":"x"}');
+    expect(existsSync(join(certDir, `${UUID}.json`))).toBe(false);
+    expect(fetchToken).not.toHaveBeenCalled();
+  });
+
+  it("fetches credentials after a create when cloudflared left none it can find", async () => {
     findTunnel.mockResolvedValue(undefined);
     createTunnel.mockResolvedValue(UUID);
+
+    await reconcile(input());
+
+    expect(fetchToken).toHaveBeenCalledWith("cfld-myapp", credsFile(UUID), "/certs/example.com.pem");
+  });
+
+  it("creates a tunnel when none exists, then routes DNS", async () => {
+    findTunnel.mockResolvedValue(undefined);
+    // With the default cert, cloudflared writes the credentials into ~/.cloudflared.
+    createTunnel.mockImplementation(async () => {
+      writeFileSync(credsFile(UUID), "{}");
+      return UUID;
+    });
 
     const res = await reconcile(input());
 

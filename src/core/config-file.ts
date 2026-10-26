@@ -21,7 +21,9 @@ export interface IngressConfig {
 
 export function renderIngressConfig(cfg: IngressConfig): string {
   const rules = cfg.routes.flatMap((r) => {
-    const lines = [`  - hostname: ${r.hostname}`];
+    // A wildcard host (`*.example.com`) must be quoted: a bare leading `*` is a YAML alias.
+    const host = r.hostname.startsWith("*") ? JSON.stringify(r.hostname) : r.hostname;
+    const lines = [`  - hostname: ${host}`];
     if (r.path) lines.push(`    path: ${r.path}`);
     lines.push(`    service: http://localhost:${r.port}`);
     return lines;

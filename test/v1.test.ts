@@ -9,6 +9,7 @@ import {
   serviceSlug,
 } from "../src/core/service.js";
 import { ensureGitignored } from "../src/util/gitignore.js";
+import { renderIngressConfig } from "../src/core/config-file.js";
 import { readProjectConfig, writeProjectConfig } from "../src/core/project-config.js";
 
 const spec = {
@@ -40,6 +41,21 @@ describe("service unit rendering", () => {
     expect(unit).toContain("run cfld-myapp");
     expect(unit).toContain("Restart=always");
     expect(unit).toContain("WantedBy=default.target");
+  });
+});
+
+describe("ingress config rendering", () => {
+  it("quotes a wildcard hostname so YAML doesn't read `*` as an alias", () => {
+    const yml = renderIngressConfig({
+      slug: "launch",
+      uuid: "u-1",
+      routes: [
+        { hostname: "local.example.com", port: 3000 },
+        { hostname: "*.example.com", port: 3001 },
+      ],
+    });
+    expect(yml).toContain("  - hostname: local.example.com\n");
+    expect(yml).toContain('  - hostname: "*.example.com"\n');
   });
 });
 
